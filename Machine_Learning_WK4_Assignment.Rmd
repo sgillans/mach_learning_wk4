@@ -1,0 +1,183 @@
+---
+title: "Barbell exercise correctness prediction"
+author: "Stephen Gillanders"
+date: "10/8/2017"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(cache=TRUE)
+```
+
+## The Barbell data 
+
+A group of 6 participants performed barbell lifts correctly and incorrectly in 5 different ways. The data comes from the article on "Wearable Computing: Accelerometers' Data Classification of Body Postures and Movements" in the [Proceedings of 21st Brazilian Symposium on Artificial Intelligence](http://web.archive.org/web/20161224072740/http:/groupware.les.inf.puc-rio.br/har). Please refer to the web link for details.
+
+The goal of the following analysis is the accurate prediction of the type of exercise based on the measured variables. The variable "classe" reflects this outcome.
+
+## Obtain Data
+```{r pml}
+if (!file.exists("./pml-training.csv")) {
+    download.file("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv","./pml-training.csv")
+}
+if (!file.exists("./pml-testing.csv")) {
+    download.file("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv","./pml-testing.csv")
+}
+full_training <- read.csv("./pml-training.csv",header=TRUE,na.strings=c("NA","#DIV/0!"))
+full_testing <- read.csv("./pml-testing.csv",header=TRUE,na.strings=c("NA","#DIV/0!"))
+```
+```{r data_summary,echo=FALSE}
+sprintf("Training set: %d observations of %d variables",
+        dim(full_training)[1],dim(full_training)[2])
+sprintf("Testing set: %d observations of %d variables",
+        dim(full_testing)[1],dim(full_testing)[2])
+```
+## R libraries
+
+```{r doc_setup,message=FALSE,results=FALSE}
+library(randomForest)
+library(caret)
+library(plyr)
+library(dplyr)
+library(adabag)
+library(knitr)
+```
+## Preliminary Exploration
+```{r prel_explore}
+# Check for completeness of the data
+sprintf("Number of complete cases in training set: %d",sum(complete.cases(full_training)))
+tNA <- apply(full_training,2,anyNA)
+sprintf("Number of variables with one or more NA values: %d",sum(tNA))
+tnNA <- apply(full_training[,tNA],2,function(x) 100*(sum(is.na(x))/dim(full_training)[1]))
+hist(tnNA,main="NA-containing variables",xlab="Percent NA")
+```
+Visible in the plot above is that the `r sum(tNA)` NA-containing variables are mostly >95% incomplete. It turns out that they are "summary" variables (eg. kurtosis, skewness, average...) and removing them from the set leaves "real observation variables":
+```{r observs, echo=FALSE}
+nm <- names(full_training)
+nm[!tNA]
+```
+For this exercise the variables will be limited to the ones listed above except we also  remove the following variables:
+
+* X
+* user_name
+* raw_timestamp_part_1
+* raw_timestamp_part_2
+* cvtd_timestamp
+* num_window
+
+as when and who should not be important in predicting the type of exercise.
+
+```{r split_data}
+# Select only the variables of interest
+full_training <- select(full_training,nm[!tNA])
+# remove also the when and who variables
+full_training <- select(full_training,-c(1:6))
+# repeat for test data
+nmt <- names(full_testing)
+testNA <- apply(full_testing,2,anyNA)
+full_testing <- select(full_testing,nmt[!testNA])
+full_testing <- select(full_testing,-c(1:6))
+```
+
+There are no "near zero variance" variables as evidenced by:
+```{r nz}
+nearZeroVar(full_training)
+```
+The full training data set now consists of `r sum(complete.cases(full_training))` complete observations.
+
+```{r divide_and_conquer}
+# divide the training data into a training and testing and cross-validation set.
+set.seed(1234)
+trainIndex <- createDataPartition(full_training$classe,p=0.6,list=FALSE)
+pmlTraining <- full_training[trainIndex,]
+otherTemp <- full_training[-trainIndex,]
+cvIndex <- createDataPartition(otherTemp$classe,p=0.5,list=FALSE)
+pmlTesting <- otherTemp[cvIndex,]
+pmlCrossValidation <- otherTemp[-cvIndex,]
+```
+
+```{r explore}
+# Separate out the outcome
+pmlTrClasse <- pmlTraining[,"classe"]
+pmlTeClasse <- pmlTesting[,"classe"]
+pmlCvClasse <- pmlCrossValidation[,"classe"]
+pmlTraining <- select(pmlTraining,-classe)
+pmlTesting <- select(pmlTesting,-classe)
+pmlCrossValidation <- select(pmlCrossValidation,-classe)
+```
+## Model building
+
+First, a model based on simple decision trees:
+
+```{r decision_tree}
+mtrees <- train(pmlTraining,pmlTrClasse,method="rpart")
+mtreesTrClasse <- factor(max.col(predict(mtrees$finalModel,newdata=pmlTraining)),levels=c(1,2,3,4,5),labels=c("A","B","C","D","E"))
+mtreesTeClasse <- factor(max.col(predict(mtrees$finalModel,newdata=pmlTesting)),levels=c(1,2,3,4,5),labels=c("A","B","C","D","E"))
+mtreesCM <- confusionMatrix(mtreesTeClasse,pmlTeClasse)
+mtreesCM$overall ; mtreesCM$table
+```
+
+Lets see if this can be improved. Next a random forest model
+
+```{r randomforest}
+mrf <- randomForest(pmlTraining,pmlTrClasse)
+mrfTrClasse <- predict(mrf,newdata=pmlTraining)
+mrfTeClasse <- predict(mrf,newdata=pmlTesting)
+mrfCM <- confusionMatrix(mrfTeClasse,pmlTeClasse)
+mrfCM$overall ; mrfCM$table
+```
+Great, accuracy improves.
+
+Lets try adaptive boosting:
+
+```{r adaboost}
+madab <- boosting(pmlTrClasse~.,data=cbind(pmlTraining,pmlTrClasse),mfinal=100)
+madabTrClasse <- factor(max.col(predict(madab,newdata=pmlTraining)$prob),levels=c(1,2,3,4,5),labels=c("A","B","C","D","E"))
+madabTeClasse <- factor(max.col(predict(madab,newdata=pmlTesting)$prob),levels=c(1,2,3,4,5),labels=c("A","B","C","D","E"))
+madabCM <- confusionMatrix(madabTeClasse,pmlTeClasse)
+madabCM$overall ; madabCM$table
+```
+
+Similar performance as random forest.
+
+Now a stacked model which we train on the testing set and test on the cross validation set:
+```{r combined}
+pmlCombTraining <- data.frame(rpart=mtreesTrClasse,rf=mrfTrClasse,adab=madabTrClasse)
+pmlCombTesting <- data.frame(rpart=mtreesTeClasse,rf=mrfTeClasse,adab=madabTeClasse)
+pmlCombCv <- data.frame(
+                rpart=factor(max.col(
+                        predict(mtrees$finalModel,
+                            newdata=pmlCrossValidation)),
+                        levels=c(1,2,3,4,5),labels=c("A","B","C","D","E")),
+                rf=predict(mrf,newdata=pmlCrossValidation),
+                adab=factor(max.col(
+                    predict(madab,
+                            newdata=pmlCrossValidation)$prob),
+                    levels=c(1,2,3,4,5),labels=c("A","B","C","D","E"))
+            )
+finalModel <- train(pmlCombTesting,pmlTeClasse,method="rf")
+combCM <- confusionMatrix(predict(finalModel,pmlCombCv),pmlCvClasse)
+combCM$overall ; combCM$table
+```
+Excellent accuracy now. The expectation is that the out of sample error will be less than half a percent (< 0.5%).
+
+To  apply the model to the actual testing observations:
+```{r actual_testing,results="asis"}
+combined_test_data <- data.frame(
+                rpart=factor(max.col(
+                        predict(mtrees$finalModel,
+                            newdata=full_testing)),
+                        levels=c(1,2,3,4,5),labels=c("A","B","C","D","E")),
+                rf=predict(mrf,newdata=full_testing),
+                adab=factor(max.col(
+                    predict(madab,
+                            newdata=full_testing)$prob),
+                    levels=c(1,2,3,4,5),labels=c("A","B","C","D","E")),
+                problem_id=full_testing$problem_id
+            )
+df <- data.frame(problem_id=full_testing$problem_id,
+                 prediction=predict(finalModel,combined_test_data))
+# kable(df)
+```
+
